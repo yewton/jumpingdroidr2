@@ -1,23 +1,433 @@
-// Games made using `agb` are no_std which means you don't have access to the standard
-// rust library. This is because the game boy advance doesn't really have an operating
-// system, so most of the content of the standard library doesn't apply.
-//
-// Provided you haven't disabled it, agb does provide an allocator, so it is possible
-// to use both the `core` and the `alloc` built in crates.
 #![no_std]
-// `agb` defines its own `main` function, so you must declare your game's main function
-// using the #[agb::entry] proc macro. Failing to do so will cause failure in linking
-// which won't be a particularly clear error message.
 #![no_main]
-// This is required to allow writing tests
 #![cfg_attr(test, feature(custom_test_frameworks))]
 #![cfg_attr(test, reexport_test_harness_main = "test_main")]
 #![cfg_attr(test, test_runner(agb::test_runner::test_runner))]
 
-// The main function must take 1 arguments and never return. The agb::entry decorator
-// ensures that everything is in order. `agb` will call this after setting up the stack
-// and interrupt handlers correctly. It will also handle creating the `Gba` struct for you.
+use agb::display::object::{Graphics, Sprite, Tag, TagMap};
+use agb::display::tiled::{
+    MapLoan, RegularBackgroundSize, RegularMap, TileFormat, TiledMap, VRamManager,
+};
+use agb::display::{Priority, WIDTH};
+use agb::fixnum::Vector2D;
+use agb::input::Button;
+
+agb::include_background_gfx!(tiles,
+    "ff00ff", // 透過色
+    bg => "gfx/bg.png");
+
+const GRAPHICS: &Graphics = agb::include_aseprite!("gfx/sprites.aseprite");
+const TAG_MAP: &TagMap = GRAPHICS.tags();
+
+const IDLE: &Tag = TAG_MAP.get("Idle");
+const WALKING: &Tag = TAG_MAP.get("Walking");
+const JUMPING: &Tag = TAG_MAP.get("Jumping");
+const RED_IDLE: &Tag = TAG_MAP.get("Red Idle");
+const RED_WALKING: &Tag = TAG_MAP.get("Red Walking");
+const RED_JUMPING: &Tag = TAG_MAP.get("Red Jumping");
+
+fn rgb5(r: u8, g: u8, b: u8) -> u16 {
+    let (r, g, b) = (r as u16, g as u16, b as u16);
+    (r) | ((g) << 5) | ((b) << 10)
+}
+
+// 過去実装で OBJ_CHAR (ATTR2_ID) で表現していた部分の互換処理
+fn sprite_for_char(ch: u16, red: bool) -> &'static Sprite {
+    let (walking, jumping, idle) = if red {
+        (RED_WALKING, RED_JUMPING, RED_IDLE)
+    } else {
+        (WALKING, JUMPING, IDLE)
+    };
+    match ch {
+        2 => walking.sprite(0),
+        4 => walking.sprite(2),
+        6 => jumping.sprite(0),
+        8 => jumping.sprite(1),
+        10 => jumping.sprite(2),
+        _ => idle.sprite(0),
+    }
+}
+
+fn draw_bg_cloud(
+    pos: impl Into<Vector2D<u16>>,
+    vram: &mut VRamManager,
+    bg: &mut MapLoan<RegularMap>,
+) {
+    let tileset = &tiles::bg.tiles;
+    let vec: Vector2D<u16> = pos.into();
+    for yy in [0, 1] {
+        for xx in 0..=3 {
+            let tile_pos: (u16, u16) = (vec.x + xx, vec.y + yy);
+            let idx: usize = ((4 + xx) + (32 * yy)) as usize;
+            bg.set_tile(vram, tile_pos, tileset, tiles::bg.tile_settings[idx]);
+        }
+    }
+}
+
+fn set_background(vram: &mut VRamManager, bg: &mut MapLoan<RegularMap>) {
+    for pos in [
+        (1u16, 4),
+        (10, 2),
+        (15, 1),
+        (17, 3),
+        (21, 0),
+        (24, 6),
+        (29, 3),
+    ] {
+        draw_bg_cloud(pos, vram, bg);
+    }
+}
+
+#[rustfmt::skip]
+static STAGE: [[usize; 216]; 20] = [
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
+    [2,2,0,0,2,2,2,2,0,0,2,2,2,2,0,0,2,2,2,2,0,0,2,2,2,2,2,0,2,2,2,0,0,0,0,2,2,2,0,0,2,2,2,0,0,0,0,2,2,2,0,0,2,2,2,2,0,0,2,2,2,2,0,0,2,2,2,0,0,0,2,2,2,2,0,0,2,2,2,0,0,0,2,2,2,0,0,0,0,2,2,0,0,0,0,2,2,2,0,0,2,2,2,0,2,2,0,2,2,0,0,0,0,2,2,0,0,0,0,2,2,0,2,2,0,2,2,0,0,2,2,2,0,2,2,2,0,2,0,2,2,2,0,2,2,0,0,0,0,2,2,0,0,0,2,2,2,0,0,0,2,2,2,0,0,0,2,2,2,2,0,0,2,2,2,0,0,0,0,2,2,0,2,2,0,2,0,2,2,2,0,2,0,2,2,2,2,0,2,0,2,2,0,2,0,2,2,2,0,2,2,0,0,0,0,0],
+    [2,0,2,2,0,2,2,0,0,0,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,2,0,0,2,2,2,0,2,2,2,2,2,0,2,2,2,2,2,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,0,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,2,2,2,0,2,2,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,2,0,0,2,2,2,2,2,0,2,2,2,0,2,0,2,2,2,0,0,2,2,2,0,0,2,0,0,2,0,0,2,2,0,2,0,2,2,2,2,0,2,0,2,2,0,2,0,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,2,2,2,2,0,0,2,2,2,0,2,2,0,2,0,2,2,2,0,2,0,2,2,2,2,0,2,0,2,2,0,2,0,2,2,2,0,2,2,2,2,2,0,2],
+    [2,0,2,2,0,2,2,2,0,0,2,2,2,0,2,2,0,2,2,2,0,0,2,2,2,0,2,0,2,2,2,0,0,0,2,2,2,0,0,0,2,2,2,2,2,0,2,2,2,2,0,0,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,0,0,2,2,2,0,2,2,2,2,2,0,2,2,0,2,2,0,0,0,0,2,2,0,0,0,2,2,2,0,2,2,2,2,2,0,0,0,0,2,2,2,0,0,2,2,2,2,2,0,2,2,2,0,0,2,2,2,2,0,0,2,2,2,0,2,0,2,0,2,0,2,0,2,0,2,0,2,2,2,2,0,2,0,2,2,0,2,0,2,2,2,0,2,2,0,2,2,0,2,2,2,0,0,2,2,2,2,0,0,2,2,2,0,2,2,0,2,0,2,2,2,0,2,0,2,2,2,2,0,2,2,0,0,2,2,2,0,2,0,2,2,2,2,2,0,2,2],
+    [2,0,2,2,0,2,2,2,0,0,2,2,2,2,2,0,2,2,2,2,2,2,0,2,0,0,0,0,0,2,2,2,2,2,0,2,2,0,2,2,0,2,2,2,0,2,2,2,2,0,2,2,0,2,2,2,0,0,0,2,2,0,0,0,0,2,2,0,2,2,0,2,2,0,2,2,2,2,2,0,2,2,0,2,2,0,2,2,2,2,2,0,2,2,2,2,2,0,2,0,0,2,2,0,0,0,0,2,2,2,0,0,2,2,2,2,2,0,2,2,2,0,0,2,2,2,2,0,0,2,2,2,0,2,2,2,0,2,0,2,2,0,0,2,0,2,2,2,2,0,2,0,0,0,2,2,0,2,2,0,0,2,2,0,0,0,2,2,2,2,2,2,0,2,2,2,0,0,2,2,2,0,2,2,0,2,0,2,2,2,0,2,0,2,2,2,2,0,2,2,0,0,2,2,2,2,0,2,2,2,2,2,0,2,2,2],
+    [2,0,2,2,0,2,2,2,0,0,2,2,2,2,0,2,2,2,2,0,2,2,0,2,2,2,2,0,2,2,2,2,2,2,0,2,2,0,2,2,0,2,2,2,0,2,2,2,2,0,2,2,0,2,2,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,2,2,2,0,2,2,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,2,0,0,2,2,2,0,2,0,2,2,2,0,2,0,2,2,2,0,0,2,2,2,0,2,2,2,0,2,0,2,2,2,0,2,0,2,2,2,2,0,2,0,2,2,2,2,0,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,0,2,2,2,0,0,2,2,2,0,2,2,0,2,2,0,2,0,2,2,0,2,0,0,2,0,2,0,2,2,0,2,2,2,0,2,2,2,2,0,2,2,2,2],
+    [2,2,0,0,2,2,2,0,0,0,0,2,2,0,0,0,0,2,2,2,0,0,2,2,2,2,2,0,2,2,2,0,0,0,2,2,2,2,0,0,2,2,2,2,0,2,2,2,2,2,0,0,2,2,2,2,0,0,2,2,2,0,2,2,0,2,2,0,0,0,2,2,2,2,0,0,2,2,2,0,0,0,2,2,2,0,0,0,0,2,2,0,2,2,2,2,2,2,0,0,2,2,2,0,2,2,0,2,2,0,0,0,0,2,2,2,0,2,2,2,2,0,2,2,0,2,2,0,0,0,0,2,0,2,2,2,0,2,0,2,2,2,0,2,2,0,0,0,0,2,2,0,2,2,2,2,2,0,0,0,2,0,2,0,2,2,0,2,2,2,0,0,2,2,2,2,0,0,2,2,2,2,0,0,2,2,2,2,0,2,2,2,2,0,2,2,0,2,2,0,2,2,0,2,2,2,0,2,2,2,0,0,0,0,0,2]
+];
+
+fn calc_actual_pos_x(mw: u16, vx: i32) -> i32 {
+    if vx < (WIDTH / 2) {
+        return vx;
+    }
+    if (mw as i32 - (WIDTH / 2)) < vx {
+        return vx - (mw as i32 - WIDTH);
+    }
+    return WIDTH / 2;
+}
+
+fn calc_bg_offset(mw: u16, vx: i32, co: i16) -> i16 {
+    if vx < (WIDTH / 2) {
+        return co;
+    }
+    if (mw as i32 - (WIDTH / 2)) < vx {
+        return co;
+    };
+    return (vx - (WIDTH / 2)) as i16;
+}
+
+fn init_stage(vram: &mut VRamManager, bg: &mut MapLoan<RegularMap>) {
+    let tileset = &tiles::bg.tiles;
+    for yy in 0u16..20 {
+        for xx in 0u16..60 {
+            let tile_id = STAGE[yy as usize][xx as usize];
+            bg.set_tile(vram, (xx, yy), tileset, tiles::bg.tile_settings[tile_id]);
+        }
+    }
+}
+
+/// ステージの描画
+///
+/// # Arguments
+///
+/// * `mw`: マップ幅
+/// * `offset`: 画面オフセット
+/// * `mov`: 移動方向(正なら進む、負なら戻る、0 なら移動していない)
+fn draw_stage(mw: u16, offset: u16, mov: i8, vram: &mut VRamManager, bg: &mut MapLoan<RegularMap>) {
+    if mov == 0 {
+        return;
+    }; // 移動していない
+    let m: u16; // オフセットのマス換算
+    let dstart: i16;
+    let (dend, sstart): (i16, i16);
+    if 0 < mov {
+        // 進んだ
+        m = (offset - 1) >> 3;
+        dstart = (m as i16 + 35) % 64;
+        sstart = m as i16 + 35;
+    } else {
+        // 戻った
+        m = offset >> 3;
+        dstart = (m as i16 - 25) % 64;
+        sstart = m as i16 - 25;
+    }
+    if (m % 15) != 0 {
+        return; // 再描画ポイント上でない
+    }
+
+    let (mut dx, mut dy, mut ddx, mut sx, mut sy): (i16, i16, i16, i16, i16);
+    let max_stage_pos: u16 = mw >> 3;
+
+    let tileset = &tiles::bg.tiles;
+    dend = dstart + 15;
+    for i in 0..20 {
+        (sy, dy) = (i, i);
+        (sx, dx) = (sstart, dstart);
+        while (dx < dend) && (sx < max_stage_pos as i16) {
+            if 0 <= sx {
+                if dx < 0 {
+                    ddx = dx + 64;
+                } else if dx < 64 {
+                    ddx = dx;
+                } else {
+                    ddx = dx - 64;
+                }
+                let tile_id = STAGE[sy as usize][sx as usize];
+                bg.set_tile(
+                    vram,
+                    (ddx as u16, dy as u16),
+                    tileset,
+                    tiles::bg.tile_settings[tile_id],
+                );
+            }
+            dx += 1;
+            sx += 1;
+        }
+    }
+}
+
 #[agb::entry]
 fn main(mut gba: agb::Gba) -> ! {
-    agb::no_game(gba);
+    let vblank = agb::interrupt::VBlank::get();
+    // グラフィックスモード 0
+    let (gfx, mut vram) = gba.display.video.tiled0();
+    let mut input = agb::input::ButtonController::new();
+    // https://www.coranac.com/tonc/text/regbg.htm#ssec-ctrl-bgs
+    let mut bg0 = gfx.background(
+        Priority::P0,                           // BG0
+        RegularBackgroundSize::Background32x32, // BG_REG_32x32
+        TileFormat::FourBpp,                    // BG_4BPP 16 色
+    );
+    /* BG のパレットのメモリ領域にパレットデータをコピー */
+    vram.set_background_palettes(tiles::PALETTES);
+    // 背景色の設定
+    vram.set_background_palette_colour(
+        0, // パレットバンク番号
+        0, // パレット内の色番号
+        rgb5(20, 20, 31),
+    );
+
+    set_background(&mut vram, &mut bg0);
+    bg0.commit(&mut vram);
+    bg0.set_visible(true);
+
+    /* BG 1 の設定 */
+    let mut bg1 = gfx.background(
+        Priority::P1,                           // BG1
+        RegularBackgroundSize::Background64x32, // BG_REG_64x32
+        TileFormat::FourBpp,                    // BG_4BPP 16 色
+    );
+    init_stage(&mut vram, &mut bg1);
+    bg1.commit(&mut vram);
+    bg1.set_visible(true);
+
+    /* ドロイド君の x, y 座標 */
+    let (mut dx, mut dy) = (120, 88);
+    /*
+     * ドロイド君の状態。
+     * 0 => 待機
+     * 1 => ジャンプ準備中
+     * 2 => ジャンプ中
+     */
+    let mut state = 0u8;
+    /* ドロイド君の y 方向の速度 */
+    let mut vy = 0f32;
+
+    /* 表示するキャラクタ */
+    let mut ch = 0u16;
+    /* 歩き状態 (0, 1, 2) */
+    let mut wstate = 0u8;
+    /* ドロイド君 */
+    let object = gba.display.object.get_managed();
+    let mut droid_object = object.object_sprite(IDLE.sprite(0));
+    droid_object.set_position((dx, dy)).set_z(0).show();
+
+    /* フレーム数用の変数 */
+    let mut f = 0u16;
+    let v_map_width = 1728u16; // 仮想マップ幅
+    let _v_map_height = 160u16; // 仮想マップ高さ
+    let mut v_player_pos_x = 120i32; // 仮想プレイヤー x 座標
+    let mut v_player_pos_y = 88i32; // 仮想プレイヤー y 座標
+    let mut bg_offset = 0i16;
+    let mut prev_bg_offset: i16;
+    let mut baisoku: u8;
+    let mut red = false;
+    loop {
+        /* キー状態取得 */
+        input.update();
+
+        // BG スクロール
+        prev_bg_offset = bg_offset;
+        bg_offset = calc_bg_offset(v_map_width, v_player_pos_x, bg_offset);
+        bg0.set_scroll_pos((bg_offset / 3, 0));
+        bg1.set_scroll_pos((bg_offset, 0));
+
+        // ステージ描画
+        draw_stage(
+            v_map_width,
+            bg_offset as u16,
+            (bg_offset - prev_bg_offset) as i8,
+            &mut vram,
+            &mut bg1,
+        );
+
+        match state {
+            /* 待機中 */
+            0 if input.is_just_pressed(Button::A) => {
+                // ジャンプ開始
+                state = 1;
+                f = 0;
+                ch = 0;
+            }
+            0 if input.is_just_released(Button::UP) => {
+                red = true;
+            }
+            0 if input.is_just_released(Button::DOWN) => {
+                red = false;
+            }
+            0 => {
+                if input.is_pressed(Button::LEFT) {
+                    v_player_pos_x -= 1;
+                    if input.is_pressed(Button::B) {
+                        v_player_pos_x -= 1;
+                    }
+                    droid_object.set_hflip(true);
+                }
+                if input.is_pressed(Button::RIGHT) {
+                    v_player_pos_x += 1;
+                    if input.is_pressed(Button::B) {
+                        v_player_pos_x += 1;
+                    }
+                    droid_object.set_hflip(false);
+                }
+                if v_player_pos_x < 0 {
+                    v_player_pos_x = 0;
+                }
+                if v_map_width - 16 < v_player_pos_x as u16 {
+                    v_player_pos_x = (v_map_width - 16) as i32;
+                }
+                if input.is_just_pressed(Button::LEFT) || input.is_just_pressed(Button::RIGHT) {
+                    wstate = 0;
+                    f = 0;
+                }
+                if input.is_just_released(Button::LEFT) || input.is_just_released(Button::RIGHT) {
+                    ch = 0;
+                }
+                if input.is_pressed(Button::LEFT) || input.is_pressed(Button::RIGHT) {
+                    /* 歩きモーション */
+                    if input.is_pressed(Button::B) {
+                        baisoku = 1;
+                    } else {
+                        baisoku = 0;
+                    }
+                    f += 1;
+                    if 5 / (baisoku as u16 + 1) < f {
+                        match wstate {
+                            0 => {
+                                wstate = 1;
+                                ch = 2;
+                            }
+                            1 => {
+                                wstate = 2;
+                                ch = 0;
+                            }
+                            2 => {
+                                wstate = 3;
+                                ch = 4
+                            }
+                            _ => {
+                                wstate = 0;
+                                ch = 0;
+                            }
+                        }
+                        f = 0
+                    }
+                }
+                dx = calc_actual_pos_x(v_map_width, v_player_pos_x);
+                droid_object
+                    .set_position((dx, dy))
+                    .set_sprite(object.sprite(sprite_for_char(ch, red)));
+            }
+            1 | 3 => {
+                /* ジャンプ準備 */
+                droid_object.set_sprite(object.sprite(sprite_for_char(6, red)));
+                if input.is_pressed(Button::B) {
+                    baisoku = 1;
+                } else {
+                    baisoku = 0;
+                }
+                f += 1;
+                if 2 - (baisoku as u16 * 2) < f {
+                    vy = 4.;
+                    if 1 == state {
+                        state = 2
+                    } else {
+                        state = 4
+                    };
+                }
+            }
+            2 if input.is_just_pressed(Button::A) => {
+                /* 二段ジャンプ */
+                state = 3;
+                f = 0;
+            }
+            2 | 4 => {
+                /* ジャンプ中 */
+                if input.is_pressed(Button::LEFT) {
+                    v_player_pos_x -= 1;
+                    if input.is_pressed(Button::B) {
+                        v_player_pos_x -= 1;
+                    }
+                    droid_object.set_hflip(true);
+                }
+                if input.is_pressed(Button::RIGHT) {
+                    v_player_pos_x += 1;
+                    if input.is_pressed(Button::B) {
+                        v_player_pos_x += 1;
+                    }
+                    droid_object.set_hflip(false);
+                }
+                if v_player_pos_x < 0 {
+                    v_player_pos_x = 0;
+                }
+                if v_map_width - 16 < v_player_pos_x as u16 {
+                    v_player_pos_x = (v_map_width - 16) as i32;
+                }
+                if 0.5 < vy && input.is_pressed(Button::A) {
+                    vy += 0.2;
+                }
+                v_player_pos_y -= vy as i32;
+                if vy < 0. {
+                    droid_object.set_sprite(object.sprite(sprite_for_char(10, red)));
+                } else {
+                    droid_object.set_sprite(object.sprite(sprite_for_char(8, red)));
+                }
+                if v_player_pos_y < 0 {
+                    v_player_pos_y = 0;
+                    vy = -0.;
+                }
+                if 88 < v_player_pos_y {
+                    /* 着地 */
+                    v_player_pos_y = 88;
+                    state = 0;
+                }
+                dx = calc_actual_pos_x(v_map_width, v_player_pos_x);
+                dy = v_player_pos_y;
+                droid_object.set_position((dx, dy));
+                vy -= 0.3;
+            }
+            _ => {}
+        }
+        /* VBLANK 割り込み待ち */
+        vblank.wait_for_vblank();
+        bg0.commit(&mut vram);
+        bg1.commit(&mut vram);
+        object.commit();
+    }
 }
